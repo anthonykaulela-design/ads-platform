@@ -4,27 +4,78 @@ const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_ad_network_key_2026';
-const MINIMUM_WITHDRAWAL = 500.00; // R500 threshold
+// Ensure uploads directory exists for raw image/video files
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+app.use('/uploads', express.static(uploadDir));
 
-// TiDB Database Connection Pool Configuration
+// Configure Multer for raw multi-format media uploads
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadDir),
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = /jpeg|jpg|png|gif|mp4|webm|ogg|mov/;
+        const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+        const mimetype = allowedTypes.test(file.mimetype);
+        if (mimetype && extname) return cb(null, true);
+        cb(new Error('Only raw image and video files are permitted!'));
+    }
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_ad_network_key_2026';
+const MINIMUM_WITHDRAWAL = 500.00;
+const MINIMUM_ADVERTISER_DEPOSIT = 2000.00;
+const HOST_URL = process.env.HOST_URL || 'https://ads-platform-vjsg.onrender.com';
+
+const PAYFAST_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '32880521';
+const PAYFAST_MERCHANT_KEY = process.env.PAYFAST_MERCHANT_KEY || 'wfx9nr9j9cvlm';
+
 const db = mysql.createPool({
-    host: process.env.TIDB_HOST || '127.0.0.1',
-    port: process.env.TIDB_PORT || 4000,
-    user: process.env.TIDB_USER || 'root',
-    password: process.env.TIDB_PASSWORD || '',
-    database: process.env.TIDB_DATABASE || 'ad_network',
-    ssl: process.env.TIDB_SSL === 'true' ? { rejectUnauthorized: true } : false,
+    host: process.env.TIDB_HOST || 'gateway01.eu-central-1.prod.aws.tidbcloud.com',
+    port: parseInt(process.env.TIDB_PORT || '4000'),
+    user: process.env.TIDB_USER || 'KLQaiBoivGWMnF9.root',
+    password: process.env.TIDB_PASSWORD || 'QgYk345DiiCIdhM1',
+    database: process.env.TIDB_DATABASE || 'policy_admin',
+    ssl: { rejectUnauthorized: true },
     waitForConnections: true,
     connectionLimit: 10
 });
 
-// Authentication Middleware
+async function seedDatabase() {
+    try {
+        const [rows] = await db.execute('SELECT * FROM users WHERE email = ?', ['admin']);
+        if (rows.length === 0) {
+            const hashedAdminPassword = await bcrypt.hash('admin', 10);
+            await db.execute(
+                `INSERT INTO users (name, email, password_hash, role, bank_name, account_number, branch_code, balance) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                ['L3 System Owner', 'admin', hashedAdminPassword, 'admin', 'System Bank', '000000000', '000', 0.00]
+            );
+        }
+    } catch (err) {
+        console.error('Seeding error:', err.message);
+    }
+}
+
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -38,34 +89,28 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ==========================================
-// 1. AUTHENTICATION & USER MANAGEMENT
+// 1. AUTHENTICATION & BALANCE
 // ==========================================
 
-// Register Account (Advertiser or Publisher)
 app.post('/api/auth/register', async (req, res) => {
     const { name, email, password, role, bank_name, account_number, branch_code } = req.body;
-    
-    if (!['advertiser', 'publisher'].includes(role)) {
-        return res.status(400).json({ error: 'Invalid role selection.' });
-    }
-    if (!bank_name || !account_number || !branch_code) {
-        return res.status(400).json({ error: 'Banking details are mandatory for payment processing.' });
-    }
+    if (!['advertiser', 'publisher'].includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+    if (!bank_name || !account_number || !branch_code) return res.status(400).json({ error: 'Banking details required.' });
 
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         const [result] = await db.execute(
-            `INSERT INTO users (name, email, password_hash, role, bank_name, account_number, branch_code) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO users (name, email, password_hash, role, bank_name, account_number, branch_code, balance) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0.00)`,
             [name, email, hashedPassword, role, bank_name, account_number, branch_code]
         );
-        res.status(201).json({ message: 'Account registered successfully', userId: result.insertId });
+        res.status(201).json({ message: 'Registered successfully', userId: result.insertId });
     } catch (err) {
-        res.status(500).json({ error: 'User registration failed. Email may already be in use.', details: err.message });
+        if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'Email already registered.' });
+        res.status(500).json({ error: 'Registration failed.', details: err.message });
     }
 });
 
-// Login Route
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     try {
@@ -76,67 +121,174 @@ app.post('/api/auth/login', async (req, res) => {
         const validPassword = await bcrypt.compare(password, user.password_hash);
         if (!validPassword) return res.status(401).json({ error: 'Invalid credentials.' });
 
-        const token = jwt.sign(
-            { id: user.id, email: user.email, role: user.role }, 
-            JWT_SECRET, 
-            { expiresIn: '24h' }
-        );
-
+        const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
         res.json({
             token,
-            user: {
-                id: user.id,
-                name: user.name,
-                email: user.email,
-                role: user.role,
-                balance: user.balance
-            }
+            user: { id: user.id, name: user.name, email: user.email, role: user.role, balance: parseFloat(user.balance || 0) }
         });
     } catch (err) {
-        res.status(500).json({ error: 'Server error during login.' });
+        res.status(500).json({ error: 'Login error.', details: err.message });
+    }
+});
+
+app.get('/api/user/balance', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await db.execute('SELECT balance FROM users WHERE id = ?', [req.user.id]);
+        if (rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+
+        let totalDeposited = 0;
+        if (req.user.role === 'advertiser') {
+            const [depRows] = await db.execute(
+                'SELECT SUM(amount) AS total FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
+                [req.user.id]
+            );
+            totalDeposited = parseFloat(depRows[0].total || 0);
+        }
+
+        res.json({
+            balance: parseFloat(rows[0].balance || 0),
+            total_deposited: totalDeposited,
+            required_deposit: MINIMUM_ADVERTISER_DEPOSIT,
+            can_publish_ads: req.user.role === 'admin' || totalDeposited >= MINIMUM_ADVERTISER_DEPOSIT
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch balance.' });
     }
 });
 
 // ==========================================
-// 2. ADVERTISER MODULE & CAMPAIGNS
+// 2. PAYFAST DEPOSITS
 // ==========================================
 
-// Create Campaign (Advertisers only)
-app.post('/api/advertiser/campaigns', authenticateToken, async (req, res) => {
+app.post('/api/advertiser/deposit-checkout', authenticateToken, async (req, res) => {
     if (req.user.role !== 'advertiser') return res.status(403).json({ error: 'Advertiser access only.' });
 
-    const { title, target_url, image_url, budget, cpm, cpc } = req.body;
+    const payfastData = {
+        merchant_id: PAYFAST_MERCHANT_ID,
+        merchant_key: PAYFAST_MERCHANT_KEY,
+        return_url: `${HOST_URL}`,
+        cancel_url: `${HOST_URL}`,
+        notify_url: `${HOST_URL}/api/advertiser/deposit-notify`,
+        m_payment_id: `DEP-${req.user.id}-${Date.now()}`,
+        amount: MINIMUM_ADVERTISER_DEPOSIT.toFixed(2),
+        item_name: `Ad Creator Deposit - User #${req.user.id}`,
+        email_address: req.user.email
+    };
+
+    res.json({ gateway: 'https://www.payfast.co.za/eng/process', payload: payfastData });
+});
+
+app.post('/api/advertiser/deposit-notify', async (req, res) => {
+    const paymentData = req.body;
+    if (paymentData && paymentData.payment_status === 'COMPLETE') {
+        const parts = paymentData.m_payment_id.split('-');
+        if (parts.length >= 2) {
+            const userId = parseInt(parts[1]);
+            const amount = parseFloat(paymentData.amount_gross || MINIMUM_ADVERTISER_DEPOSIT);
+            try {
+                await db.execute(
+                    `INSERT INTO advertiser_deposits (user_id, amount, payfast_payment_id, status) VALUES (?, ?, ?, 'completed')`,
+                    [userId, amount, paymentData.pf_payment_id || 'PF-LIVE']
+                );
+                await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [amount, userId]);
+            } catch (err) {
+                console.error('Deposit log error:', err.message);
+            }
+        }
+    }
+    res.status(200).send('OK');
+});
+
+// ==========================================
+// 3. CAMPAIGNS & MULTI-AD TYPE MANAGEMENT
+// ==========================================
+
+// Create Campaign (Supports multiple ad types: image, video, text, html_rich)
+app.post('/api/advertiser/campaigns', authenticateToken, upload.single('media_file'), async (req, res) => {
+    if (req.user.role !== 'advertiser' && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Advertiser access only.' });
+    }
+
+    if (req.user.role !== 'admin') {
+        const [depRows] = await db.execute(
+            'SELECT SUM(amount) AS total FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
+            [req.user.id]
+        );
+        const totalDeposited = parseFloat(depRows[0].total || 0);
+        if (totalDeposited < MINIMUM_ADVERTISER_DEPOSIT) {
+            return res.status(403).json({ error: `Publication denied. Minimum deposit of R${MINIMUM_ADVERTISER_DEPOSIT.toFixed(2)} required.` });
+        }
+    }
+
+    const { title, target_url, budget, ad_type, text_content, html_content } = req.body;
+    let mediaUrl = '';
+    if (req.file) {
+        mediaUrl = `${HOST_URL}/uploads/${req.file.filename}`;
+    }
+
+    const resolvedAdType = ad_type || 'image';
+
     try {
         const [result] = await db.execute(
-            `INSERT INTO campaigns (advertiser_id, title, target_url, image_url, budget, cpm, cpc) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [req.user.id, title, target_url, image_url, budget, cpm || 10.00, cpc || 2.00]
+            `INSERT INTO campaigns (advertiser_id, title, target_url, image_url, budget, ad_type, text_content, html_content, status, cpm, cpc) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 10.00, 2.00)`,
+            [req.user.id, title, target_url || '', mediaUrl, budget, resolvedAdType, text_content || '', html_content || '']
         );
-        res.status(201).json({ message: 'Campaign created', campaignId: result.insertId });
+        res.status(201).json({ message: 'Campaign published successfully', campaignId: result.insertId, status: 'active' });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to create campaign.' });
+        res.status(500).json({ error: 'Failed to publish campaign.', details: err.message });
     }
 });
 
-// Comprehensive Stats (Analytics match Google Ads performance indicators)
-app.get('/api/advertiser/analytics', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'advertiser') return res.status(403).json({ error: 'Advertiser access only.' });
+// EXTERNAL TOOL API INTEGRATION: Allows your other tool to publish ads using platform user login credentials (JWT)
+app.post('/api/external/campaigns', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'advertiser' && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Advertiser authorization required.' });
+    }
+
+    const { title, target_url, media_url, budget, ad_type, text_content, html_content } = req.body;
+    const resolvedAdType = ad_type || 'image';
 
     try {
+        const [result] = await db.execute(
+            `INSERT INTO campaigns (advertiser_id, title, target_url, image_url, budget, ad_type, text_content, html_content, status, cpm, cpc) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 10.00, 2.00)`,
+            [req.user.id, title, target_url || '', media_url || '', budget || 2000.00, resolvedAdType, text_content || '', html_content || '']
+        );
+        res.status(201).json({ success: true, message: 'Campaign published via external tool API', campaignId: result.insertId, status: 'active' });
+    } catch (err) {
+        res.status(500).json({ error: 'External campaign publishing failed.', details: err.message });
+    }
+});
+
+// Pause / Unpause Campaign for Advertisers
+app.put('/api/advertiser/campaigns/:id/status', authenticateToken, async (req, res) => {
+    const { status } = req.body; // 'active' or 'paused'
+    if (!['active', 'paused'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status value. Use active or paused.' });
+    }
+
+    try {
+        const [result] = await db.execute(
+            'UPDATE campaigns SET status = ? WHERE id = ? AND advertiser_id = ?',
+            [status, req.params.id, req.user.id]
+        );
+        if (result.affectedRows === 0) return res.status(404).json({ error: 'Campaign not found or unauthorized.' });
+        res.json({ message: `Campaign successfully ${status}.`, status });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update campaign status.' });
+    }
+});
+
+app.get('/api/advertiser/analytics', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'advertiser' && req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied.' });
+    try {
         const [stats] = await db.execute(
-            `SELECT 
-                c.id AS campaign_id,
-                c.title,
-                c.budget,
-                c.spent AS total_spent,
+            `SELECT c.*, 
                 COUNT(CASE WHEN e.event_type = 'impression' THEN 1 END) AS impressions,
-                COUNT(CASE WHEN e.event_type = 'click' THEN 1 END) AS clicks,
-                ROUND((COUNT(CASE WHEN e.event_type = 'click' THEN 1 END) / NULLIF(COUNT(CASE WHEN e.event_type = 'impression' THEN 1 END), 0)) * 100, 2) AS ctr,
-                ROUND(AVG(CASE WHEN e.event_type = 'click' THEN e.gross_cost END), 2) AS avg_cpc
-             FROM campaigns c
-             LEFT JOIN ad_events e ON c.id = e.campaign_id
-             WHERE c.advertiser_id = ?
-             GROUP BY c.id`,
+                COUNT(CASE WHEN e.event_type = 'click' THEN 1 END) AS clicks
+             FROM campaigns c LEFT JOIN ad_events e ON c.id = e.campaign_id
+             WHERE c.advertiser_id = ? GROUP BY c.id`,
             [req.user.id]
         );
         res.json({ analytics: stats });
@@ -146,216 +298,165 @@ app.get('/api/advertiser/analytics', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 3. PUBLISHER MODULE & DOMAINS
+// 4. PUBLISHER DOMAINS & PAUSE CONTROLS
 // ==========================================
 
-// Register Publisher Domain
 app.post('/api/publisher/domains', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'publisher') return res.status(403).json({ error: 'Publisher access only.' });
-
+    if (req.user.role !== 'publisher' && req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied.' });
     const { domain_name } = req.body;
     try {
-        const [result] = await db.execute(
-            `INSERT INTO publisher_domains (publisher_id, domain_name) VALUES (?, ?)`,
-            [req.user.id, domain_name]
-        );
-        
-        // Generate Embed Code for Publisher's Website
-        const embedCode = `<!-- Ad Network Code -->
-<div id="ad-unit-slot" data-publisher-id="${req.user.id}" data-domain="${domain_name}"></div>
-<script src="http://localhost:5000/ad-tag.js" async></script>`;
-
-        res.status(201).json({ 
-            message: 'Domain registered successfully', 
-            domainId: result.insertId,
-            embedCode 
-        });
+        await db.execute('INSERT INTO publisher_domains (publisher_id, domain_name, status) VALUES (?, ?, "active")', [req.user.id, domain_name]);
+        const embedCode = `<!-- L3 Ad Network Widget -->\n<div id="ad-unit-slot" data-publisher-id="${req.user.id}" data-domain="${domain_name}"></div>\n<script src="${HOST_URL}/ad-tag.js" async></script>`;
+        res.status(201).json({ message: 'Domain registered', embedCode });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to register domain.' });
+        res.status(500).json({ error: 'Domain registration failed.' });
     }
 });
 
-// Publisher Earnings & Performance Stats
-app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'publisher') return res.status(403).json({ error: 'Publisher access only.' });
+// Pause / Unpause Publisher Domain Widget
+app.put('/api/publisher/domains/:id/status', authenticateToken, async (req, res) => {
+    const { status } = req.body; // 'active' or 'paused'
+    if (!['active', 'paused'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status. Use active or paused.' });
+    }
 
+    try {
+        const [result] = await db.execute(
+            'UPDATE publisher_domains SET status = ? WHERE id = ? AND publisher_id = ?',
+            [status, req.params.id, req.user.id]
+        );
+        if (result.affectedRows === 0) return res.status(404).json({ error: 'Domain not found or unauthorized.' });
+        res.json({ message: `Publisher domain widget successfully ${status}.`, status });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update domain status.' });
+    }
+});
+
+app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'publisher' && req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied.' });
     try {
         const [userRows] = await db.execute('SELECT balance FROM users WHERE id = ?', [req.user.id]);
         const [eventStats] = await db.execute(
-            `SELECT 
-                COUNT(CASE WHEN event_type = 'impression' THEN 1 END) AS impressions,
-                COUNT(CASE WHEN event_type = 'click' THEN 1 END) AS clicks,
-                SUM(publisher_payout) AS total_earned
-             FROM ad_events 
-             WHERE publisher_id = ?`,
+            `SELECT COUNT(CASE WHEN event_type = 'impression' THEN 1 END) AS impressions,
+                    COUNT(CASE WHEN event_type = 'click' THEN 1 END) AS clicks,
+                    SUM(publisher_payout) AS total_earned FROM ad_events WHERE publisher_id = ?`,
             [req.user.id]
         );
-
+        const [domains] = await db.execute(
+            `SELECT d.id, d.domain_name, d.status, 
+                    COUNT(CASE WHEN e.event_type = 'impression' THEN 1 END) AS impressions,
+                    COUNT(CASE WHEN e.event_type = 'click' THEN 1 END) AS clicks,
+                    COALESCE(SUM(e.publisher_payout), 0) AS total_earned
+             FROM publisher_domains d LEFT JOIN ad_events e ON d.publisher_id = e.publisher_id
+             WHERE d.publisher_id = ? GROUP BY d.id`,
+            [req.user.id]
+        );
         res.json({
-            current_balance: userRows[0].balance,
+            current_balance: parseFloat(userRows[0].balance || 0),
             minimum_withdrawal_threshold: MINIMUM_WITHDRAWAL,
-            can_withdraw: userRows[0].balance >= MINIMUM_WITHDRAWAL,
+            can_withdraw: parseFloat(userRows[0].balance || 0) >= MINIMUM_WITHDRAWAL,
             impressions: eventStats[0].impressions || 0,
             clicks: eventStats[0].clicks || 0,
-            total_earned: eventStats[0].total_earned || 0.00
+            total_earned: eventStats[0].total_earned || 0,
+            domains: domains
         });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch publisher performance.' });
+        res.status(500).json({ error: 'Failed to load stats.' });
     }
 });
 
-// Request Payout (Enforces minimum R500 threshold)
 app.post('/api/publisher/withdraw', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'publisher') return res.status(403).json({ error: 'Publisher access only.' });
-
+    if (req.user.role !== 'publisher' && req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied.' });
     try {
         const [userRows] = await db.execute('SELECT balance FROM users WHERE id = ?', [req.user.id]);
-        const currentBalance = parseFloat(userRows[0].balance);
-
-        if (currentBalance < MINIMUM_WITHDRAWAL) {
-            return res.status(400).json({ 
-                error: `Payout threshold not reached. Current balance: R${currentBalance.toFixed(2)}. Minimum required: R${MINIMUM_WITHDRAWAL.toFixed(2)}.` 
-            });
+        const balance = parseFloat(userRows[0].balance || 0);
+        if (balance < MINIMUM_WITHDRAWAL) {
+            return res.status(400).json({ error: `Threshold not reached. Balance: R${balance.toFixed(2)}.` });
         }
-
-        // Process Withdrawal Transaction
         await db.execute('UPDATE users SET balance = 0.00 WHERE id = ?', [req.user.id]);
-        await db.execute('INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, ?)', [req.user.id, currentBalance, 'pending']);
-
-        res.json({ message: `Payout of R${currentBalance.toFixed(2)} requested successfully. Status: Pending.` });
+        await db.execute('INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, "pending")', [req.user.id, balance]);
+        res.json({ message: `Payout request of R${balance.toFixed(2)} submitted successfully.` });
     } catch (err) {
-        res.status(500).json({ error: 'Withdrawal processing failed.' });
+        res.status(500).json({ error: 'Withdrawal failed.' });
     }
 });
 
 // ==========================================
-// 4. AD SERVING ENGINE & 50/50 SPLIT EXECUTION
+// 5. AD SERVING ENGINE (Multi-Ad Type Rendering)
 // ==========================================
 
-// Authenticated Web Domain Ad Serving Route
 app.get('/api/ads/serve', async (req, res) => {
     const { publisher_id, domain } = req.query;
-
-    if (!publisher_id || !domain) {
-        return res.status(400).json({ error: 'Unregistered publisher or missing domain authentication parameters.' });
-    }
+    if (!publisher_id || !domain) return res.status(400).json({ error: 'Missing parameters.' });
 
     try {
-        // Authenticate domain registration against database records
+        // Verify publisher domain is active and not paused
         const [domains] = await db.execute(
-            'SELECT * FROM publisher_domains WHERE publisher_id = ? AND domain_name = ?',
+            'SELECT * FROM publisher_domains WHERE publisher_id = ? AND domain_name = ? AND status = "active"',
             [publisher_id, domain]
         );
+        if (domains.length === 0) return res.status(403).json({ error: 'Domain is paused or unregistered.' });
 
-        if (domains.length === 0) {
-            return res.status(403).json({ error: 'Unauthorized domain. Domain is not registered under this publisher account.' });
-        }
-
-        // Fetch an active campaign with remaining budget
+        // Select an active campaign that is not paused and has available budget
         const [campaigns] = await db.execute(
             'SELECT * FROM campaigns WHERE status = "active" AND (budget - spent) > 0 ORDER BY RAND() LIMIT 1'
         );
-
-        if (campaigns.length === 0) {
-            return res.status(404).json({ error: 'No active ad inventory available.' });
-        }
+        if (campaigns.length === 0) return res.status(404).json({ error: 'No active inventory.' });
 
         const ad = campaigns[0];
-        
-        // Calculate 50/50 Financial Split (CPM based)
         const grossCost = parseFloat(ad.cpm) / 1000;
-        const publisherShare = grossCost * 0.50; // 50% split to publisher
-        const agencyShare = grossCost * 0.50;    // 50% split to your network agency
+        const publisherShare = grossCost * 0.50;
+        const agencyShare = grossCost * 0.50;
 
-        // Log impression ledger transaction
-        await db.execute(
-            `INSERT INTO ad_events (campaign_id, publisher_id, event_type, gross_cost, publisher_payout, agency_revenue, ip_address)
-             VALUES (?, ?, 'impression', ?, ?, ?, ?)`,
-            [ad.id, publisher_id, grossCost, publisherShare, agencyShare, req.ip]
-        );
-
-        // Update campaign expenditure and publisher balance
+        await db.execute('INSERT INTO ad_events (campaign_id, publisher_id, event_type, gross_cost, publisher_payout, agency_revenue, ip_address) VALUES (?, ?, "impression", ?, ?, ?, ?)', [ad.id, publisher_id, grossCost, publisherShare, agencyShare, req.ip]);
         await db.execute('UPDATE campaigns SET spent = spent + ? WHERE id = ?', [grossCost, ad.id]);
         await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [publisherShare, publisher_id]);
 
-        // Output rendered HTML banner element
+        // Render dynamic ad markup based on ad_type chosen by advertiser
+        let mediaHtml = '';
+        if (ad.ad_type === 'video') {
+            mediaHtml = `<video src="${ad.image_url}" autoplay muted loop style="max-width:100%;height:auto;"></video>`;
+        } else if (ad.ad_type === 'text') {
+            mediaHtml = `<div style="padding:15px;background:#f9f9f9;font-weight:bold;color:#333;">${ad.text_content || ad.title}</div>`;
+        } else if (ad.ad_type === 'html_rich') {
+            mediaHtml = `<div>${ad.html_content || ''}</div>`;
+        } else {
+            // Default image banner
+            mediaHtml = `<img src="${ad.image_url}" style="max-width:100%;height:auto;" />`;
+        }
+
         res.json({
             ad_id: ad.id,
-            html: `<div style="border: 1px solid #ccc; padding: 10px; max-width: 300px; text-align: center; font-family: sans-serif;">
-                    <a href="http://localhost:5000/api/ads/click?campaign_id=${ad.id}&publisher_id=${publisher_id}" target="_blank">
-                        <img src="${ad.image_url}" alt="${ad.title}" style="max-width: 100%; height: auto;" />
-                        <h4 style="margin: 5px 0;">${ad.title}</h4>
-                    </a>
-                   </div>`
+            ad_type: ad.ad_type,
+            html: `<div style="border:1px solid #ccc;padding:10px;text-align:center;"><a href="${HOST_URL}/api/ads/click?campaign_id=${ad.id}&publisher_id=${publisher_id}" target="_blank">${mediaHtml}<h4 style="margin-top:8px;">${ad.title}</h4></a></div>`
         });
     } catch (err) {
         res.status(500).json({ error: 'Ad serve error.' });
     }
 });
 
-// Authenticated Domain Click Tracking Route
 app.get('/api/ads/click', async (req, res) => {
     const { campaign_id, publisher_id } = req.query;
-
     try {
         const [campaigns] = await db.execute('SELECT * FROM campaigns WHERE id = ?', [campaign_id]);
         if (campaigns.length === 0) return res.status(404).send('Campaign not found.');
-
         const ad = campaigns[0];
         const grossCost = parseFloat(ad.cpc);
-        const publisherShare = grossCost * 0.50;
-        const agencyShare = grossCost * 0.50;
+        const publisherShare = publisher_id ? grossCost * 0.50 : 0.00;
+        const agencyShare = publisher_id ? grossCost * 0.50 : grossCost;
 
-        // Log click ledger record
-        await db.execute(
-            `INSERT INTO ad_events (campaign_id, publisher_id, event_type, gross_cost, publisher_payout, agency_revenue, ip_address)
-             VALUES (?, ?, 'click', ?, ?, ?, ?)`,
-            [campaign_id, publisher_id || null, grossCost, publisherShare, agencyShare, req.ip]
-        );
-
-        // Update spent balances
+        await db.execute('INSERT INTO ad_events (campaign_id, publisher_id, event_type, gross_cost, publisher_payout, agency_revenue, ip_address) VALUES (?, ?, "click", ?, ?, ?, ?)', [campaign_id, publisher_id || null, grossCost, publisherShare, agencyShare, req.ip]);
         await db.execute('UPDATE campaigns SET spent = spent + ? WHERE id = ?', [grossCost, campaign_id]);
-        if (publisher_id) {
-            await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [publisher_id, publisherShare]);
-        }
+        if (publisher_id) await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [publisherShare, publisher_id]);
 
         res.redirect(ad.target_url);
     } catch (err) {
-        res.status(500).send('Error redirecting.');
-    }
-});
-
-// ==========================================
-// 5. UNAUTHENTICATED DIRECT MARKETING LINK ROUTE
-// ==========================================
-// Does NOT require domain or publisher account verification
-app.get('/api/ads/direct-link/:campaign_id', async (req, res) => {
-    const { campaign_id } = req.params;
-
-    try {
-        const [campaigns] = await db.execute('SELECT * FROM campaigns WHERE id = ? AND status = "active"', [campaign_id]);
-        if (campaigns.length === 0) return res.status(404).send('Direct link campaign expired or invalid.');
-
-        const ad = campaigns[0];
-        const grossCost = parseFloat(ad.cpc);
-        const publisherShare = 0.00; // No domain publisher assigned
-        const agencyShare = grossCost; // Agency keeps total proceeds for direct traffic links
-
-        // Record tracking event
-        await db.execute(
-            `INSERT INTO ad_events (campaign_id, publisher_id, event_type, gross_cost, publisher_payout, agency_revenue, ip_address)
-             VALUES (?, NULL, 'click', ?, ?, ?, ?)`,
-            [campaign_id, grossCost, publisherShare, agencyShare, req.ip]
-        );
-
-        await db.execute('UPDATE campaigns SET spent = spent + ? WHERE id = ?', [grossCost, campaign_id]);
-
-        // Redirect directly to destination
-        res.redirect(ad.target_url);
-    } catch (err) {
-        res.status(500).send('Direct link error.');
+        res.status(500).send('Redirect error.');
     }
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Ad Network Engine active on port ${PORT}`));
+app.listen(PORT, async () => {
+    console.log(`L3 Ad Network Server active on port ${PORT}`);
+    await seedDatabase();
+});
