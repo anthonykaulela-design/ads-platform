@@ -329,7 +329,6 @@ app.put('/api/publisher/domains/:id/status', authenticateToken, async (req, res)
     }
 });
 
-// Persists domain records and generated embed code across logout/login sessions
 app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
     if (req.user.role !== 'publisher' && req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied.' });
     try {
@@ -350,7 +349,6 @@ app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
             [req.user.id]
         );
 
-        // Attach dynamic embed codes so publishers can view their codes anytime after logging back in
         const domainsWithEmbed = domains.map(dom => ({
             ...dom,
             embed_code: `<!-- L3 Ad Network Widget -->\n<div id="ad-unit-slot" data-publisher-id="${req.user.id}" data-domain="${dom.domain_name}"></div>\n<script src="${HOST_URL}/ad-tag.js" async></script>`
@@ -387,7 +385,33 @@ app.post('/api/publisher/withdraw', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. AD SERVING ENGINE
+// 5. AD-TAG.JS SCRIPT ENDPOINT (FIXES AD DISPLAY)
+// ==========================================
+
+app.get('/ad-tag.js', (req, res) => {
+    res.setHeader('Content-Type', 'application/javascript');
+    res.send(`
+        (function() {
+            const slot = document.getElementById('ad-unit-slot');
+            if (!slot) return;
+            const pubId = slot.getAttribute('data-publisher-id');
+            const domain = slot.getAttribute('data-domain');
+            if (!pubId || !domain) return;
+
+            fetch('${HOST_URL}/api/ads/serve?publisher_id=' + pubId + '&domain=' + encodeURIComponent(domain))
+                .then(response => response.json())
+                .then(data => {
+                    if (data && data.html) {
+                        slot.innerHTML = data.html;
+                    }
+                })
+                .catch(err => console.error('L3 Ad Load Error:', err));
+        })();
+    `);
+});
+
+// ==========================================
+// 6. AD SERVING ENGINE
 // ==========================================
 
 app.get('/api/ads/serve', async (req, res) => {
