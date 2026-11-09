@@ -136,20 +136,27 @@ app.get('/api/user/balance', authenticateToken, async (req, res) => {
         const [rows] = await db.execute('SELECT balance FROM users WHERE id = ?', [req.user.id]);
         if (rows.length === 0) return res.status(404).json({ error: 'User not found.' });
 
-        let totalDeposited = 0;
+        let netRemainingFunds = 0;
         if (req.user.role === 'advertiser') {
             const [depRows] = await db.execute(
-                'SELECT SUM(amount) AS total FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
+                'SELECT SUM(amount) AS total_deposited FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
                 [req.user.id]
             );
-            totalDeposited = parseFloat(depRows[0].total || 0);
+            const totalDeposited = parseFloat(depRows[0].total_deposited || 0);
+
+            const [spentRows] = await db.execute(
+                'SELECT SUM(spent) AS total_spent FROM campaigns WHERE advertiser_id = ?',
+                [req.user.id]
+            );
+            const totalSpent = parseFloat(spentRows[0].total_spent || 0);
+            netRemainingFunds = totalDeposited - totalSpent;
         }
 
         res.json({
             balance: parseFloat(rows[0].balance || 0),
-            total_deposited: totalDeposited,
+            net_remaining_funds: netRemainingFunds,
             required_deposit: MINIMUM_ADVERTISER_DEPOSIT,
-            can_publish_ads: req.user.role === 'admin' || totalDeposited >= MINIMUM_ADVERTISER_DEPOSIT
+            can_publish_ads: req.user.role === 'admin' || netRemainingFunds >= MINIMUM_ADVERTISER_DEPOSIT
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch balance.' });
@@ -200,7 +207,7 @@ app.post('/api/advertiser/deposit-notify', async (req, res) => {
 });
 
 // ==========================================
-// 3. CAMPAIGNS & MULTI-AD TYPE MANAGEMENT
+// 3. CAMPAIGNS & DEPLETION LOCK CHECK
 // ==========================================
 
 app.post('/api/advertiser/campaigns', authenticateToken, upload.single('media_file'), async (req, res) => {
@@ -209,13 +216,24 @@ app.post('/api/advertiser/campaigns', authenticateToken, upload.single('media_fi
     }
 
     if (req.user.role !== 'admin') {
+        // Calculate net remaining funds (Deposits minus Spent)
         const [depRows] = await db.execute(
-            'SELECT SUM(amount) AS total FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
+            'SELECT SUM(amount) AS total_deposited FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
             [req.user.id]
         );
-        const totalDeposited = parseFloat(depRows[0].total || 0);
-        if (totalDeposited < MINIMUM_ADVERTISER_DEPOSIT) {
-            return res.status(403).json({ error: `Publication denied. Minimum deposit of R${MINIMUM_ADVERTISER_DEPOSIT.toFixed(2)} required.` });
+        const totalDeposited = parseFloat(depRows[0].total_deposited || 0);
+
+        const [spentRows] = await db.execute(
+            'SELECT SUM(spent) AS total_spent FROM campaigns WHERE advertiser_id = ?',
+            [req.user.id]
+        );
+        const totalSpent = parseFloat(spentRows[0].total_spent || 0);
+        const netRemainingFunds = totalDeposited - totalSpent;
+
+        if (netRemainingFunds < MINIMUM_ADVERTISER_DEPOSIT) {
+            return res.status(403).json({ 
+                error: `Publication denied. Your funds are depleted. Remaining funds (R${netRemainingFunds.toFixed(2)}) are below the minimum R${MINIMUM_ADVERTISER_DEPOSIT.toFixed(2)} threshold. Please deposit additional funds to continue.` 
+            });
         }
     }
 
@@ -239,10 +257,31 @@ app.post('/api/advertiser/campaigns', authenticateToken, upload.single('media_fi
     }
 });
 
-// External Tool API Integration
+// External Tool API Integration with Depletion Lock Check
 app.post('/api/external/campaigns', authenticateToken, async (req, res) => {
     if (req.user.role !== 'advertiser' && req.user.role !== 'admin') {
         return res.status(403).json({ error: 'Advertiser authorization required.' });
+    }
+
+    if (req.user.role !== 'admin') {
+        const [depRows] = await db.execute(
+            'SELECT SUM(amount) AS total_deposited FROM advertiser_deposits WHERE user_id = ? AND status = "completed"',
+            [req.user.id]
+        );
+        const totalDeposited = parseFloat(depRows[0].total_deposited || 0);
+
+        const [spentRows] = await db.execute(
+            'SELECT SUM(spent) AS total_spent FROM campaigns WHERE advertiser_id = ?',
+            [req.user.id]
+        );
+        const totalSpent = parseFloat(spentRows[0].total_spent || 0);
+        const netRemainingFunds = totalDeposited - totalSpent;
+
+        if (netRemainingFunds < MINIMUM_ADVERTISER_DEPOSIT) {
+            return res.status(403).json({ 
+                error: `External publication denied. Funds depleted. Remaining funds: R${netRemainingFunds.toFixed(2)}.` 
+            });
+        }
     }
 
     const { title, target_url, media_url, budget, ad_type, text_content, html_content } = req.body;
@@ -385,7 +424,7 @@ app.post('/api/publisher/withdraw', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. AD-TAG.JS SCRIPT ENDPOINT (FIXES AD DISPLAY)
+// 5. AD-TAG.JS SCRIPT ENDPOINT
 // ==========================================
 
 app.get('/ad-tag.js', (req, res) => {
