@@ -203,7 +203,6 @@ app.post('/api/advertiser/deposit-notify', async (req, res) => {
 // 3. CAMPAIGNS & MULTI-AD TYPE MANAGEMENT
 // ==========================================
 
-// Create Campaign (Supports multiple ad types: image, video, text, html_rich)
 app.post('/api/advertiser/campaigns', authenticateToken, upload.single('media_file'), async (req, res) => {
     if (req.user.role !== 'advertiser' && req.user.role !== 'admin') {
         return res.status(403).json({ error: 'Advertiser access only.' });
@@ -240,7 +239,7 @@ app.post('/api/advertiser/campaigns', authenticateToken, upload.single('media_fi
     }
 });
 
-// EXTERNAL TOOL API INTEGRATION: Allows your other tool to publish ads using platform user login credentials (JWT)
+// External Tool API Integration
 app.post('/api/external/campaigns', authenticateToken, async (req, res) => {
     if (req.user.role !== 'advertiser' && req.user.role !== 'admin') {
         return res.status(403).json({ error: 'Advertiser authorization required.' });
@@ -261,11 +260,10 @@ app.post('/api/external/campaigns', authenticateToken, async (req, res) => {
     }
 });
 
-// Pause / Unpause Campaign for Advertisers
 app.put('/api/advertiser/campaigns/:id/status', authenticateToken, async (req, res) => {
-    const { status } = req.body; // 'active' or 'paused'
+    const { status } = req.body;
     if (!['active', 'paused'].includes(status)) {
-        return res.status(400).json({ error: 'Invalid status value. Use active or paused.' });
+        return res.status(400).json({ error: 'Invalid status value.' });
     }
 
     try {
@@ -298,7 +296,7 @@ app.get('/api/advertiser/analytics', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 4. PUBLISHER DOMAINS & PAUSE CONTROLS
+// 4. PUBLISHER DOMAINS & EMBED CODE PERSISTENCE
 // ==========================================
 
 app.post('/api/publisher/domains', authenticateToken, async (req, res) => {
@@ -313,11 +311,10 @@ app.post('/api/publisher/domains', authenticateToken, async (req, res) => {
     }
 });
 
-// Pause / Unpause Publisher Domain Widget
 app.put('/api/publisher/domains/:id/status', authenticateToken, async (req, res) => {
-    const { status } = req.body; // 'active' or 'paused'
+    const { status } = req.body;
     if (!['active', 'paused'].includes(status)) {
-        return res.status(400).json({ error: 'Invalid status. Use active or paused.' });
+        return res.status(400).json({ error: 'Invalid status.' });
     }
 
     try {
@@ -332,6 +329,7 @@ app.put('/api/publisher/domains/:id/status', authenticateToken, async (req, res)
     }
 });
 
+// Persists domain records and generated embed code across logout/login sessions
 app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
     if (req.user.role !== 'publisher' && req.user.role !== 'admin') return res.status(403).json({ error: 'Access denied.' });
     try {
@@ -351,6 +349,13 @@ app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
              WHERE d.publisher_id = ? GROUP BY d.id`,
             [req.user.id]
         );
+
+        // Attach dynamic embed codes so publishers can view their codes anytime after logging back in
+        const domainsWithEmbed = domains.map(dom => ({
+            ...dom,
+            embed_code: `<!-- L3 Ad Network Widget -->\n<div id="ad-unit-slot" data-publisher-id="${req.user.id}" data-domain="${dom.domain_name}"></div>\n<script src="${HOST_URL}/ad-tag.js" async></script>`
+        }));
+
         res.json({
             current_balance: parseFloat(userRows[0].balance || 0),
             minimum_withdrawal_threshold: MINIMUM_WITHDRAWAL,
@@ -358,7 +363,7 @@ app.get('/api/publisher/analytics', authenticateToken, async (req, res) => {
             impressions: eventStats[0].impressions || 0,
             clicks: eventStats[0].clicks || 0,
             total_earned: eventStats[0].total_earned || 0,
-            domains: domains
+            domains: domainsWithEmbed
         });
     } catch (err) {
         res.status(500).json({ error: 'Failed to load stats.' });
@@ -382,7 +387,7 @@ app.post('/api/publisher/withdraw', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. AD SERVING ENGINE (Multi-Ad Type Rendering)
+// 5. AD SERVING ENGINE
 // ==========================================
 
 app.get('/api/ads/serve', async (req, res) => {
@@ -390,14 +395,12 @@ app.get('/api/ads/serve', async (req, res) => {
     if (!publisher_id || !domain) return res.status(400).json({ error: 'Missing parameters.' });
 
     try {
-        // Verify publisher domain is active and not paused
         const [domains] = await db.execute(
             'SELECT * FROM publisher_domains WHERE publisher_id = ? AND domain_name = ? AND status = "active"',
             [publisher_id, domain]
         );
         if (domains.length === 0) return res.status(403).json({ error: 'Domain is paused or unregistered.' });
 
-        // Select an active campaign that is not paused and has available budget
         const [campaigns] = await db.execute(
             'SELECT * FROM campaigns WHERE status = "active" AND (budget - spent) > 0 ORDER BY RAND() LIMIT 1'
         );
@@ -412,7 +415,6 @@ app.get('/api/ads/serve', async (req, res) => {
         await db.execute('UPDATE campaigns SET spent = spent + ? WHERE id = ?', [grossCost, ad.id]);
         await db.execute('UPDATE users SET balance = balance + ? WHERE id = ?', [publisherShare, publisher_id]);
 
-        // Render dynamic ad markup based on ad_type chosen by advertiser
         let mediaHtml = '';
         if (ad.ad_type === 'video') {
             mediaHtml = `<video src="${ad.image_url}" autoplay muted loop style="max-width:100%;height:auto;"></video>`;
@@ -421,7 +423,6 @@ app.get('/api/ads/serve', async (req, res) => {
         } else if (ad.ad_type === 'html_rich') {
             mediaHtml = `<div>${ad.html_content || ''}</div>`;
         } else {
-            // Default image banner
             mediaHtml = `<img src="${ad.image_url}" style="max-width:100%;height:auto;" />`;
         }
 
